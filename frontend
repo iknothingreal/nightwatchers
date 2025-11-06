@@ -1,0 +1,17 @@
+* { box-sizing: border-box; }
+body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; background: #0b1020; color: #e6e8ee; }
+.app { max-width: 900px; margin: 0 auto; padding: 24px; }
+header { margin-bottom: 12px; }
+h1 { margin: 0; font-size: 20px; color: #a3b4ff; }
+.chat { background: #10162b; border: 1px solid #1f2a44; border-radius: 8px; padding: 16px; min-height: 360px; max-height: 60vh; overflow: auto; }
+.msg { padding: 10px 12px; border-radius: 8px; margin-bottom: 10px; white-space: pre-wrap; }
+.msg.user { background: #2a345a; }
+.msg.assistant { background: #18203b; }
+.controls, .tools { display: grid; grid-template-columns: 1fr auto; gap: 8px; margin-top: 12px; }
+.tools { grid-template-columns: 1fr auto 1fr auto; }
+input[type="text"] { padding: 10px; border-radius: 8px; border: 1px solid #1f2a44; background: #0e1530; color: #e6e8ee; }
+button { background: #3a4bff; color: white; border: none; border-radius: 8px; padding: 10px 14px; cursor: pointer; }
+button:hover { background: #2a3bdd; }
+.context { margin-top: 12px; padding: 12px; background: #0e1530; border: 1px solid #1f2a44; border-radius: 8px; min-height: 60px; }
+.context h3 { margin-top: 0; color: #9cb0ff; }
+.small { font-size: 12px; color: #aab2cc; }
