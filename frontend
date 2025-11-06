@@ -15,3 +15,93 @@ button:hover { background: #2a3bdd; }
 .context { margin-top: 12px; padding: 12px; background: #0e1530; border: 1px solid #1f2a44; border-radius: 8px; min-height: 60px; }
 .context h3 { margin-top: 0; color: #9cb0ff; }
 .small { font-size: 12px; color: #aab2cc; }
+
+const API_BASE = "http://localhost:8000";
+
+const chatEl = document.getElementById('chat');
+const inputEl = document.getElementById('user-input');
+const sendBtn = document.getElementById('send-btn');
+const searchQEl = document.getElementById('search-q');
+const searchBtn = document.getElementById('search-btn');
+const fetchUrlEl = document.getElementById('fetch-url');
+const fetchBtn = document.getElementById('fetch-btn');
+const ctxEl = document.getElementById('context');
+
+let messages = [
+  { role: 'system', content: 'You are a personal finance assistant. Provide educational, general information about budgeting, savings, taxes, and investments. You are not a financial advisor. Do not provide personalized financial, legal, or tax advice. Encourage users to consult a qualified professional for important decisions. When given context from search or fetched pages, cite sources with their URLs.' }
+];
+
+function renderMessage(role, content) {
+  const div = document.createElement('div');
+  div.className = `msg ${role}`;
+  div.textContent = content;
+  chatEl.appendChild(div);
+  chatEl.scrollTop = chatEl.scrollHeight;
+}
+
+async function sendMessage() {
+  const text = inputEl.value.trim();
+  if (!text) return;
+  inputEl.value = '';
+
+  messages.push({ role: 'user', content: text });
+  renderMessage('user', text);
+
+  try {
+    const res = await fetch(`${API_BASE}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages })
+    });
+    const data = await res.json();
+    const reply = data.reply || JSON.stringify(data);
+    messages.push({ role: 'assistant', content: reply });
+    renderMessage('assistant', reply);
+  } catch (e) {
+    renderMessage('assistant', `Error: ${e}`);
+  }
+}
+
+async function runSearch() {
+  const q = searchQEl.value.trim();
+  if (!q) return;
+  ctxEl.innerHTML = '<div class="small">Searching...</div>';
+  try {
+    const res = await fetch(`${API_BASE}/api/search?q=${encodeURIComponent(q)}`);
+    const data = await res.json();
+    const items = (data.results || []).map(r => `- ${r.title}\n${r.url}`).join('\n');
+    const ctxText = `Search results for: ${q}\n\n${items}`;
+    ctxEl.textContent = ctxText;
+    messages.push({ role: 'user', content: `Here are search results you can use to answer:\n${ctxText}` });
+    renderMessage('user', `(Provided search context for: ${q})`);
+  } catch (e) {
+    ctxEl.textContent = `Search error: ${e}`;
+  }
+}
+
+async function fetchUrl() {
+  const url = fetchUrlEl.value.trim();
+  if (!url) return;
+  ctxEl.innerHTML = '<div class="small">Fetching URL...</div>';
+  try {
+    const res = await fetch(`${API_BASE}/api/fetch_url`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url })
+    });
+    const data = await res.json();
+    const title = data.title ? `Title: ${data.title}\n` : '';
+    const text = data.text || '';
+    const ctxText = `${title}Source: ${data.url}\n\n${text}`;
+    ctxEl.textContent = ctxText;
+    messages.push({ role: 'user', content: `Here is content from ${data.url}:\n${ctxText}` });
+    renderMessage('user', `(Provided fetched page context: ${data.url})`);
+  } catch (e) {
+    ctxEl.textContent = `Fetch error: ${e}`;
+  }
+}
+
+sendBtn.addEventListener('click', sendMessage);
+inputEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') sendMessage(); });
+searchBtn.addEventListener('click', runSearch);
+fetchBtn.addEventListener('click', fetchUrl);
