@@ -1,0 +1,355 @@
+import os
+import json
+from typing import List, Optional
+
+import requests
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+from pathlib import Path
+from functools import lru_cache
+
+try:
+    from transformers import AutoProcessor, AutoModelForVision2Seq  # type: ignore
+    from transformers import AutoTokenizer, AutoModelForCausalLM  # type: ignore
+    _TRANSFORMERS_OK = True
+except Exception:
+    _TRANSFORMERS_OK = False
+try:
+    from PIL import Image  # type: ignore
+    _PIL_OK = True
+except Exception:
+    _PIL_OK = False
+
+# Load .env located in the same directory as this file
+_env_path = Path(__file__).with_name('.env')
+load_dotenv(dotenv_path=_env_path, override=False)
+
+HF_API_KEY = os.getenv("HUGGINGFACE_API_KEY", "")
+HF_MODEL_ID = os.getenv("HF_MODEL_ID", "ibm-granite/granite-8b-instruct")
+HF_API_URL = f"https://router.huggingface.co/hf-inference/models/{HF_MODEL_ID}"
+LOCAL_CHAT_MODEL = os.getenv("LOCAL_CHAT_MODEL", "microsoft/Phi-3-mini-4k-instruct")
+
+# Finance safety preamble to always include as the first system instruction
+FINANCE_SYSTEM_PROMPT = (
+    "You are a personal finance assistant. Provide educational, general information about "
+    "budgeting, savings, taxes, and investments. You are not a financial advisor. Do not "
+    "provide personalized financial, legal, or tax advice. Encourage users to consult a "
+    "qualified professional for important decisions. When using fetched or searched context, "
+    "cite sources with their URLs."
+)
+
+app = FastAPI(title="AI Chat with Browsing")
+
+# Allow local dev from any origin
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+class ChatMessage(BaseModel):
+    role: str  # 'system' | 'user' | 'assistant'
+    content: str
+
+
+class ChatRequest(BaseModel):
+    messages: List[ChatMessage]
+    max_new_tokens: int = 512
+    temperature: float = 0.7
+
+
+def build_prompt(messages: List[ChatMessage]) -> str:
+    # Simple chat template for instruction-tuned models with finance safety preamble
+    prompt_parts = []
+    # Always inject finance preamble first
+    prompt_parts.append(f"System: {FINANCE_SYSTEM_PROMPT}\n")
+    system_set = False
+    for m in messages:
+        if m.role == "system" and not system_set:
+            prompt_parts.append(f"System: {m.content}\n")
+            system_set = True
+        elif m.role == "user":
+            prompt_parts.append(f"User: {m.content}\n")
+        elif m.role == "assistant":
+            prompt_parts.append(f"Assistant: {m.content}\n")
+    prompt_parts.append("Assistant: ")
+    return "".join(prompt_parts)
+
+
+@app.post("/api/chat")
+def chat(req: ChatRequest):
+    # Local generation via transformers causal LM
+    if not _TRANSFORMERS_OK:
+        raise HTTPException(status_code=500, detail="transformers is not installed. Please install dependencies.")
+
+    max_new = max(1, min(req.max_new_tokens, 512))
+    temperature = req.temperature
+
+    try:
+        tokenizer, model, device = _load_local_chat()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Local chat model failed to load: {e}")
+
+    # Try to use chat template if available
+    input_ids = None
+    try:
+        # Prepare messages including finance system prompt
+        sys_msg = {"role": "system", "content": FINANCE_SYSTEM_PROMPT}
+        chat_msgs = [sys_msg] + [m.model_dump() for m in req.messages]
+        input_ids = tokenizer.apply_chat_template(
+            chat_msgs,
+            add_generation_prompt=True,
+            return_tensors="pt",
+        )
+    except Exception:
+        # Fallback to string prompt
+        prompt = build_prompt(req.messages)
+        input_ids = tokenizer(prompt, return_tensors="pt").input_ids
+
+    input_ids = input_ids.to(device)
+
+    import torch
+    with torch.no_grad():
+        outputs = model.generate(
+            input_ids=input_ids,
+            max_new_tokens=max_new,
+            do_sample=True,
+            temperature=temperature,
+            pad_token_id=(tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id),
+        )
+    # Decode only the generated continuation if we used raw prompt; if chat template, best-effort decode tail
+    generated = outputs[0]
+    try:
+        gen_len = generated.size(-1)
+        in_len = input_ids.size(-1)
+        if gen_len > in_len:
+            text = tokenizer.decode(generated[in_len:], skip_special_tokens=True)
+        else:
+            text = tokenizer.decode(generated, skip_special_tokens=True)
+    except Exception:
+        text = tokenizer.decode(generated, skip_special_tokens=True)
+
+    return {"reply": text.strip()}
+
+
+from typing import Tuple
+def _select_device():
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda"
+        return "cpu"
+    except Exception:
+        return "cpu"
+
+@lru_cache(maxsize=1)
+def _load_local_chat() -> Tuple["AutoTokenizer", "AutoModelForCausalLM", str]:
+    if not _TRANSFORMERS_OK:
+        raise RuntimeError("transformers not installed")
+    from transformers import AutoConfig  # type: ignore
+    candidate_models = [LOCAL_CHAT_MODEL]
+    tiny_fallback = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    if LOCAL_CHAT_MODEL != tiny_fallback:
+        candidate_models.append(tiny_fallback)
+
+    last_err = None
+    for model_id in candidate_models:
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(model_id)
+            device = _select_device()
+            kwargs = {}
+            try:
+                import torch
+                if device == "cuda":
+                    kwargs.update({"torch_dtype": torch.float16})
+            except Exception:
+                pass
+            model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
+            # Ensure pad token exists
+            if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
+                tokenizer.pad_token = tokenizer.eos_token
+            try:
+                model.to(device)
+            except Exception:
+                pass
+            return tokenizer, model, device
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"Failed to load local chat model(s): {last_err}")
+
+
+class URLRequest(BaseModel):
+    url: str
+
+
+@app.post("/api/fetch_url")
+def fetch_url(body: URLRequest):
+    try:
+        resp = requests.get(
+            body.url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; CascadeBot/1.0; +https://example.com/bot)",
+            },
+            timeout=20,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Fetch failed: {e}")
+
+    if not resp.ok:
+        raise HTTPException(status_code=resp.status_code, detail=f"Fetch error: {resp.text[:200]}")
+
+    content_type = resp.headers.get("content-type", "").lower()
+    if "text/html" in content_type:
+        soup = BeautifulSoup(resp.text, "html.parser")
+        title = (soup.title.string.strip() if soup.title and soup.title.string else "")
+        # Remove script/style
+        for tag in soup(["script", "style", "noscript"]):
+            tag.decompose()
+        text = soup.get_text(" ")
+        text = " ".join(text.split())
+        # Limit size
+        max_chars = 10000
+        if len(text) > max_chars:
+            text = text[:max_chars] + " …"
+        return {"title": title, "text": text, "url": body.url}
+    else:
+        # Non-HTML: return content length and type
+        size = len(resp.content)
+        return {"title": "", "text": f"Non-HTML content ({content_type}), {size} bytes.", "url": body.url}
+
+
+@app.get("/api/search")
+def search(q: str = Query(..., min_length=1, max_length=200)):
+    # DuckDuckGo HTML interface (no API key). Best-effort scraping; respect robots/ToS in production.
+    primary_url = "https://duckduckgo.com/html/"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    params = {"q": q, "kl": "us-en"}
+
+    def parse_ddg_html(text: str):
+        soup_local = BeautifulSoup(text, "html.parser")
+        out = []
+        # Try multiple selector variants
+        result_blocks = soup_local.select(".result")
+        for res in result_blocks:
+            a = res.select_one("a.result__a") or res.select_one("h2 a.result__a") or res.select_one(".result__title a")
+            if not a or not a.get("href"):
+                continue
+            title = a.get_text(" ")
+            link = a.get("href")
+            sn = res.select_one(".result__snippet") or res.select_one(".result__snippet.js-result-snippet")
+            snippet = sn.get_text(" ") if sn else ""
+            out.append({"title": title, "url": link, "snippet": snippet})
+            if len(out) >= 10:
+                break
+        return out
+
+    # Attempt primary endpoint
+    try:
+        resp = requests.get(primary_url, params=params, headers=headers, timeout=20)
+        if resp.ok:
+            results = parse_ddg_html(resp.text)
+            if results:
+                return {"query": q, "results": results}
+    except Exception:
+        pass
+
+    # Fallback: lite interface
+    lite_url = "https://lite.duckduckgo.com/lite/"
+    try:
+        resp2 = requests.get(lite_url, params={"q": q}, headers=headers, timeout=20)
+        if not resp2.ok:
+            raise HTTPException(status_code=resp2.status_code, detail="Search provider error")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Search failed: {e}")
+
+    soup = BeautifulSoup(resp2.text, "html.parser")
+    results = []
+    # Lite page links are within tables; pick top anchors with href and text
+    for a in soup.select("a"):
+        href = a.get("href")
+        text = a.get_text(" ").strip()
+        if not href or not text:
+            continue
+        # Heuristic: external links usually start with http
+        if href.startswith("http"):
+            results.append({"title": text, "url": href, "snippet": ""})
+            if len(results) >= 10:
+                break
+
+    return {"query": q, "results": results}
+
+
+# ===== Vision QA (DocLing) =====
+class VisionRequest(BaseModel):
+    image_url: str
+    question: str
+
+
+@lru_cache(maxsize=1)
+def _load_docling():
+    if not _TRANSFORMERS_OK:
+        raise RuntimeError("transformers is not installed. Please install transformers and torch.")
+    model_id = "ibm-granite/granite-docling-258M"
+    processor = AutoProcessor.from_pretrained(model_id)
+    model = AutoModelForVision2Seq.from_pretrained(model_id)
+    return processor, model
+
+
+@app.post("/api/vision_qa")
+def vision_qa(req: VisionRequest):
+    if not _PIL_OK:
+        raise HTTPException(status_code=500, detail="Pillow is not installed. Please install pillow.")
+    try:
+        processor, model = _load_docling()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Model load failed: {e}")
+
+    # Download image
+    try:
+        resp = requests.get(req.image_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+        resp.raise_for_status()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to fetch image: {e}")
+    try:
+        from io import BytesIO
+        img = Image.open(BytesIO(resp.content)).convert("RGB")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid image data: {e}")
+
+    # Build chat messages in the model's expected format
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image"},
+                {"type": "text", "text": req.question},
+            ],
+        }
+    ]
+    try:
+        inputs = processor.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+            images=[img],
+        )
+        inputs = inputs.to(model.device)
+        outputs = model.generate(**inputs, max_new_tokens=64)
+        # Decode only the generated part
+        gen_text = processor.decode(outputs[0][inputs["input_ids"].shape[-1]:])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Vision inference failed: {e}")
+
+    return {"answer": gen_text.strip()}
